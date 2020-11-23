@@ -12,7 +12,7 @@ import os
 import initialization
 import threading
 
-FAULT_TOLERANCE_ENABLED = True
+FAULT_TOLERANCE_ENABLED = False
 iExc = 0
 
 
@@ -29,7 +29,7 @@ lock = threading.Event()
 
 
 def trackAllTxs():
-    global incognitoApi, publicApi, tokenDict, lock
+    global incognitoApi, publicApi, tokenDict, lock, beaconHeight
 
     while True:
         try:
@@ -37,18 +37,25 @@ def trackAllTxs():
 
             logging.info("Service starts...")
 
-            incognitoApi = Incognito()
+            inconfig = Incognito.Config()
+            inconfig.WsUrl = "ws://localhost:19334"
+            inconfig.RpcUrl = "http://localhost:9534/"
+            inconfig.TokenListUrl = "https://genebil.com/ptoken.json"
+            incognitoApi = Incognito(inconfig)
+
+            # inconfig = Incognito.Config()
+            # inconfig.WsUrl = "ws://fullnode.incognito.best:19334"
+            # inconfig.RpcUrl = "https://fullnode.incognito.best"
+            # inconfig.TokenListUrl = "https://genebil.com/ptoken.json"
+            # incognitoApi = Incognito(inconfig)
+
             publicApi = incognitoApi.Public
+            beaconHeight = publicApi.get_beacon_height()
 
             if __debug__:
                 testFaultTolerance(3)
 
-            tokenList = publicApi.get_token_list()
-            logging.debug(tokenList)
-
-            tokenDict = {x['TokenID']: x for x in tokenList.json()['Result']}
-            tokenDict.update({PRV_ID: {'Symbol': 'PRV', 'PSymbol': 'PRV', 'PDecimals': 9}})
-
+            tokenDict = publicApi.TokenDict
             publicApi.subscribe(SubscriptionType.NewBeaconBlock, [], receiveTx)
             for shard in range(0, 8):
                 publicApi.subscribe(SubscriptionType.NewShardBlock, [shard], receiveTx)
@@ -72,7 +79,7 @@ def trackAllTxs():
 
 
 def receiveTx(subscriptionType, result):
-    global beaconHeight
+    global beaconHeight, numTotalStaker
 
     if __debug__:
         testFaultTolerance(6)
@@ -91,30 +98,7 @@ def receiveTx(subscriptionType, result):
             transactionType = metadata['Type']
             if transactionType == TransactionType.Erc20Shielding or transactionType == TransactionType.Shielding:
                 tokenData = tx.get_privacy_custom_token_data()
-                shieldedAmount = tokenData['Amount']
-                shieldedTokenId = tokenData['PropertyID']
-                if shieldedTokenId in tokenDict:
-                    token = tokenDict[shieldedTokenId]
-                    processedBeaconHeight = beaconHeight - 1
-
-                    pdePoolPairs = getPdeState(processedBeaconHeight)
-
-                    poolId = f'pdepool-{processedBeaconHeight}-{PRV_ID}-{shieldedTokenId}'
-                    if poolId in pdePoolPairs:
-                        pair = pdePoolPairs[poolId]
-                        sellAmountNormalized, buyAmountNormalized, possibleGainPercentage, _, _ = calculateGainPercentage(
-                            shieldedAmount,
-                            pair, False)
-
-                        logging.info(pair)
-                        logging.info(
-                            f'{sellAmountNormalized} {token["Symbol"]} was shielded at {processedBeaconHeight}th beacon. Possible Buy ={buyAmountNormalized:.8f}, PRV Increase= {possibleGainPercentage:.2f}%')
-
-                        if possibleGainPercentage > LOWEST_GAIN_LIMIT:
-                            message = f'🚨🛡️ {c(sellAmountNormalized)} #{token["Symbol"]} shielded. If it was sold ' \
-                                      f'completely, PRV/{token["Symbol"]} ticker would increase by 🔼{p(possibleGainPercentage)}%' \
-                                      f'\n\nTx: incscan.io/blockchain/transactions/{tx.get_hash()}'
-                            publishMessage(message)
+                moneyUnlocked(tx, tokenData['Amount'], tokenData['PropertyID'], "🛡", "shielded")
 
             elif transactionType == TransactionType.Trade and metadata['TradeStatus'] == TradeStatus.Accepted:
                 requestTxHash = metadata['RequestedTxID']
@@ -130,9 +114,9 @@ def receiveTx(subscriptionType, result):
                     for trade in trades:
                         if trade['RequestedTxID'] != requestTxHash:
                             for tradePath in trade["TradePaths"]:
-                                poolId = f'pdepool-{poolBeaconHeight}-{tradePath["Token1IDStr"]}-{tradePath["Token2IDStr"]}'
-                                if poolId in oldPdePoolPairs:
-                                    pair = oldPdePoolPairs[poolId]
+                                pair = getPool(oldPdePoolPairs, poolBeaconHeight, tradePath["Token2IDStr"],
+                                               tradePath["Token1IDStr"])
+                                if pair is not None:
                                     if tradePath["TokenIDToBuyStr"] == tradePath["Token1IDStr"]:
                                         pair["Token1PoolValue"] = pair["Token1PoolValue"] - tradePath[
                                             "ReceiveAmount"]
@@ -161,13 +145,18 @@ def receiveTx(subscriptionType, result):
                     oldCrossPrice = None
                     numTradePath = 0
                     gainPercentage = 0
+                    liquidityFailed = True
                     for tradePath in tradeOnRadar["TradePaths"]:
-                        poolId = f'pdepool-{poolBeaconHeight}-{tradePath["Token1IDStr"]}-{tradePath["Token2IDStr"]}'
-                        if poolId in oldPdePoolPairs:
-                            pair = oldPdePoolPairs[poolId]
+                        pair = getPool(oldPdePoolPairs, poolBeaconHeight, tradePath["Token2IDStr"],
+                                       tradePath["Token1IDStr"])
+                        if pair is not None:
                             prvSold = tradePath["TokenIDToBuyStr"] != tradePath["Token1IDStr"]
                             sellAmountNormalized, buyAmountNormalized, gainPercentage, oldPrice, price = calculateGainPercentage(
                                 tradePath["SellAmount"], pair, prvSold)
+
+                            if hasEnoughLiquidity(tradePath["Token2IDStr"], oldPdePoolPairs, poolBeaconHeight) and abs(
+                                    gainPercentage) > LOWEST_GAIN_LIMIT:
+                                liquidityFailed = False
 
                             messageTemplate = createTicker(tradePath["Token1IDStr"], tradePath["Token2IDStr"],
                                                            gainPercentage, price, prvSold)
@@ -188,6 +177,9 @@ def receiveTx(subscriptionType, result):
                             lastBuyTokenId = tradePath["Token2IDStr"] if prvSold else tradePath["Token1IDStr"]
                             numTradePath = numTradePath + 1
 
+                    if liquidityFailed:
+                        return
+
                     crossGainPercentage = 0
                     if numTradePath > 1:
                         crossGainPercentage = (crossPrice / oldCrossPrice - 1) * 100
@@ -197,9 +189,9 @@ def receiveTx(subscriptionType, result):
                         priceChangeForLog = messageTemplate.format(
                             f'-{crossGainPercentage},{oldCrossPrice}') + priceChangeForLog
 
-                    message = f'🚨️🔄 {c(initialSellAmount)} #{tokenDict[initialSellTokenId]["Symbol"]} ➡️  {c(buyAmountNormalized)} #{tokenDict[lastBuyTokenId]["Symbol"]}\n' \
+                    message = f'🚨️🔄 {c(initialSellAmount)} #{getCoin(initialSellTokenId)["Symbol"]} ➡️  {c(buyAmountNormalized)} #{getCoin(lastBuyTokenId)["Symbol"]}\n' \
                               f'Tickers:\n{{}}' \
-                              f'\nTx: incscan.io/blockchain/transactions/{tx.get_hash()}'
+                              f'\nTx: incscan.io/tx/{tx.get_hash()}'
 
                     logging.info(message.format(priceChangeForLog))
 
@@ -207,31 +199,121 @@ def receiveTx(subscriptionType, result):
                             numTradePath == 1 and abs(gainPercentage) > LOWEST_GAIN_LIMIT):
                         publishMessage(message.format(priceChange))
 
+            elif transactionType == TransactionType.Unstake:
+                message = f'🚨❌⛏️ A validator node has finished🔚 staking. The number of remaining validator nodes is {decreaseTotalStaker() - 7}.' \
+                          f'\n\nTx: incscan.io/tx/{tx.get_hash()}'
+                publishMessage(message)
+
+            elif transactionType == TransactionType.RemoveLiquidity:
+                unlockedTokenId = metadata['TokenIDStr']
+
+                if unlockedTokenId != PRV_ID:
+                    unlockedAmount = tx.get_privacy_custom_token_data()['Amount']
+                else:
+                    logging.info(tx)
+                    unlockedAmount = tx.get_proof_detail_output_coin_value_prv()
+
+                moneyUnlocked(tx, unlockedAmount, unlockedTokenId, "❌💵", "removed from pDEX")
+
     elif subscriptionType == SubscriptionType.NewBeaconBlock:
-        shardBlock = result
-        beaconHeight = shardBlock.get_block_height()
+        clearTotalStaker()
+        beaconBlock = result
+        beaconHeight = beaconBlock.get_block_height()
         logging.info(f'BEACON Height = {beaconHeight}')
     else:
         logging.info(result)
 
 
+stakerLock = threading.Lock()
+
+
+def clearTotalStaker():
+    global numTotalStaker
+    with stakerLock:
+        numTotalStaker = -1
+
+
+def _getTotalStaker():
+    global numTotalStaker
+    if numTotalStaker < 0:
+        numTotalStaker = publicApi.get_total_staker()
+    return numTotalStaker
+
+
+def increaseTotalStaker():
+    global numTotalStaker
+    with stakerLock:
+        numTotalStaker = _getTotalStaker() + 1
+        return numTotalStaker
+
+
+def decreaseTotalStaker():
+    global numTotalStaker
+    with stakerLock:
+        numTotalStaker = _getTotalStaker() - 1
+        return numTotalStaker
+
+
+def moneyUnlocked(tx, unlockedAmount, unlockedTokenId, icons, verb):
+    global beaconHeight
+
+    token = getCoin(unlockedTokenId)
+    if token is not None:
+        processedBeaconHeight = beaconHeight - 1
+
+        if unlockedTokenId == PRV_ID:
+            pdePoolPairs = getPdeState(processedBeaconHeight)
+            pair = getPool(pdePoolPairs, processedBeaconHeight, USDT_ID)
+
+            sellAmountNormalized, _, gainPercentage, _, _ = calculateGainPercentage(unlockedAmount, pair, True)
+
+            message = f'🚨{icons}️ {sellAmountNormalized} #{getCoin(unlockedTokenId)["Symbol"]} {verb}.' \
+                      f'\n\nTx: incscan.io/tx/{tx.get_hash()}'
+            logging.info(message)
+
+            if abs(gainPercentage) > LOWEST_GAIN_LIMIT:
+                publishMessage(message)
+
+            return
+
+        pdePoolPairs = getPdeState(processedBeaconHeight)
+        pair = getPool(pdePoolPairs, processedBeaconHeight, unlockedTokenId)
+        if pair is not None:
+            if not hasEnoughLiquidity(unlockedTokenId, pdePoolPairs, processedBeaconHeight):
+                return
+
+            sellAmountNormalized, buyAmountNormalized, possibleGainPercentage, _, _ = calculateGainPercentage(
+                unlockedAmount,
+                pair, False)
+
+            logging.info(pair)
+            logging.info(
+                f'{sellAmountNormalized} {token["Symbol"]} was {verb} at {processedBeaconHeight}th beacon. Possible Buy ={buyAmountNormalized:.8f}, PRV Increase= {possibleGainPercentage:.2f}%')
+
+            if possibleGainPercentage > LOWEST_GAIN_LIMIT:
+                message = f'🚨{icons} {c(sellAmountNormalized)} #{token["Symbol"]} {verb}. If it was sold ' \
+                          f'completely, PRV/{token["Symbol"]} ticker would increase by 🔼{p(possibleGainPercentage)}%' \
+                          f'\n\nTx: incscan.io/tx/{tx.get_hash()}'
+                publishMessage(message)
+
+
 def createTicker(sellTokenId, buyTokenId, gainPercentage, price, down):
-    return f'{tokenDict[sellTokenId]["Symbol"]}/{tokenDict[buyTokenId]["Symbol"]}: ' \
-           f'{c(price)} {"🔽-" if down else "🔼"}{p(gainPercentage)}%{{}}, ' \
-           f'{tokenDict[buyTokenId]["Symbol"]}/{tokenDict[sellTokenId]["Symbol"]}: {c(1 / price)}\n'
+    return f'{getCoin(sellTokenId)["Symbol"]}/{getCoin(buyTokenId)["Symbol"]}: ' \
+           f'{c(price)} {"🔻-" if down else "🔼"}{p(gainPercentage)}%{{}}, ' \
+           f'{getCoin(buyTokenId)["Symbol"]}/{getCoin(sellTokenId)["Symbol"]}: {c(1 / price)}\n'
 
 
 def calculateGainPercentage(amount, pair, prvSold):
     buyPoolAmount = pair['Token1PoolValue']
     sellPoolAmount = pair['Token2PoolValue']
-    buyTokenPrecision = tokenDict[pair["Token1IDStr"]]['PDecimals']
-    sellTokenPrecision = tokenDict[pair["Token2IDStr"]]['PDecimals']
+    buyTokenPrecision = getCoin(pair["Token1IDStr"])['PDecimals']
+    sellTokenPrecision = getCoin(pair["Token2IDStr"])['PDecimals']
 
     if prvSold:
         buyPoolAmount = pair['Token2PoolValue']
         sellPoolAmount = pair['Token1PoolValue']
-        buyTokenPrecision = tokenDict[pair["Token2IDStr"]]['PDecimals']
-        sellTokenPrecision = tokenDict[pair["Token1IDStr"]]['PDecimals']
+        buyTokenPrecision = getCoin(pair["Token2IDStr"])['PDecimals']
+        sellTokenPrecision = getCoin(pair["Token1IDStr"])['PDecimals']
 
     buyPoolAmountNormalized = coin(buyPoolAmount, buyTokenPrecision, False)
     sellPoolAmountNormalized = coin(sellPoolAmount, sellTokenPrecision, False)
@@ -246,21 +328,51 @@ def calculateGainPercentage(amount, pair, prvSold):
     return sellAmount, buyAmount, possibleGainPercentage, 1 / oldPrice if prvSold else oldPrice, 1 / newPrice if prvSold else newPrice
 
 
-def publishMessage(message):
-    if not __debug__:
-        try:
-            result = tg.send_message(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                text=message
-            )
-            result.wait()
-        except:
-            logging.exception("Exception when telegramming:")
+def publishMessage(message, basic=True):
+    if __debug__:
+        logging.info(f'DEBUGGED (Basic={basic}): {message}')
+    else:
+        if basic:
+            try:
+                twitterApi.update_status(message[:280])
+            except:
+                logging.exception("Exception when tweeting:")
 
-        try:
-            twitterApi.update_status(message[:280])
-        except:
-            logging.exception("Exception when tweeting:")
+            try:
+                result = tg.send_message(
+                    chat_id=TELEGRAM_CHANNEL_ID,
+                    text=message
+                )
+                result.wait()
+            except:
+                logging.exception("Exception while basic telegramming:")
+
+
+def getPool(pdePoolPairs, hBeacon, coinOnRadar, intermediateCoin=PRV_ID):
+    poolId = f'pdepool-{hBeacon}-{intermediateCoin}-{coinOnRadar}'
+
+    return pdePoolPairs[poolId] if poolId in pdePoolPairs and pdePoolPairs[poolId]["Token1PoolValue"] > 0 and \
+                                   pdePoolPairs[poolId]["Token2PoolValue"] > 0 else None
+
+
+def hasEnoughLiquidity(coinOnRadar, pdePoolPairs, hBeacon):
+    prvUsdtPair = pdePoolPairs[f'pdepool-{hBeacon}-{PRV_ID}-{USDT_ID}']
+    prvUsdcPair = pdePoolPairs[f'pdepool-{hBeacon}-{PRV_ID}-{USDC_ID}']
+
+    usdtPrecision = getCoin(USDT_ID)['PDecimals']
+    usdcPrecision = getCoin(USDC_ID)['PDecimals']
+    prvPrecision = getCoin(PRV_ID)['PDecimals']
+
+    prvPrice = (coin(prvUsdtPair['Token2PoolValue'], usdtPrecision, False) + coin(prvUsdcPair['Token2PoolValue'],
+                                                                                  usdcPrecision, False)) / coin(
+        prvUsdtPair['Token1PoolValue'] + prvUsdcPair['Token1PoolValue'], prvPrecision, False)
+
+    liquidity = coin(pdePoolPairs[f'pdepool-{hBeacon}-{PRV_ID}-{coinOnRadar}']['Token1PoolValue'],
+                     prvPrecision, False) * prvPrice * 2
+
+    logging.info(f'Liquidity of PRV/{getCoin(coinOnRadar)["Symbol"]} = {liquidity}')
+
+    return liquidity >= 10000
 
 
 def getPdeState(beaconHeight):
@@ -275,6 +387,7 @@ def getPdeState(beaconHeight):
         pdeState = publicApi.get_pde_state(beaconHeight)
         pdePoolPairs = pdeState.get_pde_pool_pairs()
         recentPdeStates.appendleft(pdeState)
+
     return pdePoolPairs
 
 
@@ -291,6 +404,21 @@ def getPdeTrades(beaconHeight):
         pdeAcceptedTrades = pdeTrades.get_accepted_trades()
         recentPdeTrades.appendleft(pdeTrades)
     return pdeAcceptedTrades
+
+
+def getCoin(tokenId):
+    global tokenDict, publicApi
+
+    if tokenId not in tokenDict:
+        result = publicApi.get_privacy_custom_token(tokenId)
+        if result.get_result("IsExist"):
+            propCoin = result.get_result("CustomToken")
+            tokenDict.update({tokenId: {'Symbol': propCoin['Symbol'], 'PSymbol': propCoin['Symbol'], 'PDecimals': 9}})
+        else:
+            publicApi.refresh_token_list()
+            tokenDict.update(publicApi.TokenDict)
+
+    return tokenDict[tokenId] if tokenId in tokenDict else None
 
 
 ##### MAIN ########
@@ -345,11 +473,11 @@ sys.excepthook = globalErrorHandler
 incognitoApi = None
 publicApi = None
 tokenDict = None
+beaconHeight = -1
+numTotalStaker = -1
+LOWEST_GAIN_LIMIT = 1
 
 recentPdeStates = deque(maxlen=5)
 recentPdeTrades = deque(maxlen=5)
 
-LOWEST_GAIN_LIMIT = 1
-
-beaconHeight = 0
 trackAllTxs()
